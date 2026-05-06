@@ -1,18 +1,17 @@
 """
-AI Course - Assignment 1: Multi-Elevator Passenger Planning
-Bar-Ilan CS 89-570
-
-AI / LLM disclosure (per assignment Section 10):
-  Used: Claude (Anthropic) for brainstorming pruning strategies and
-  discussing admissibility arguments for the heuristic. Final code,
-  proofs, and design decisions were authored by the student.
+AI disclosure:
+  Used: Claude Code for brainstorming pruning strategies and
+  discussing admissibility arguments for the heuristic. The code
+  was written by Claude. I (Shaked) directed the design through
+  discussion, verified correctness against the specification, ran
+  the local checker, and validated the implementation.
 """
 
 import search
 import utils
 from collections import deque
 
-id = ["208904839"]  # TODO: replace with your real ID before submission
+id = ["208904839"]
 
 
 # --------------------------------------------------------------------------- #
