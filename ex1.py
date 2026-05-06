@@ -107,6 +107,12 @@ class ElevatorsProblem(search.Problem):
         # under MOVE actions (h_p does not change when the elevator moves).
         self._compute_min_stints_in_elev()
 
+        # elev_overlap[(i, j)] = frozenset of floors reachable by BOTH
+        # elevator i and elevator j (transfer-floor candidates). Precomputed
+        # so the successor function avoids recomputing set intersections
+        # for every state.
+        self._compute_elev_overlap()
+
         # ---- build initial state ---------------------------------------- #
         elev_floors = tuple(elevators[eid][0] for eid in self.elevator_ids)
         person_locs = tuple(persons[pid][0] for pid in self.person_ids)
@@ -240,6 +246,23 @@ class ElevatorsProblem(search.Problem):
                         1 + best if best < INF else INF
                     )
 
+    def _compute_elev_overlap(self):
+        """
+        For every ordered pair (i, j) of distinct elevator indices, store
+        the frozenset of floors reachable by BOTH. Used by the successor
+        function to enumerate transfer-floor candidates without repeating
+        set intersections at every state expansion.
+        """
+        n = len(self.elevator_ids)
+        self.elev_overlap = {}
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                self.elev_overlap[(i, j)] = (
+                    self.elev_reachable[i] & self.elev_reachable[j]
+                )
+
     # --------------------------------------------------------------------- #
     # Helpers                                                                #
     # --------------------------------------------------------------------- #
@@ -323,15 +346,13 @@ class ElevatorsProblem(search.Problem):
                                 if other == eidx:
                                     continue
                                 if g in self.elev_transitive[other]:
-                                    overlap = reach & self.elev_reachable[other]
-                                    candidates |= overlap
+                                    candidates |= self.elev_overlap[(eidx, other)]
                     else:
                         # passenger of another elevator that needs transfer:
                         # we may anticipatorily position to receive them.
                         if g not in self.elev_reachable[in_eidx] \
                                 and g in self.elev_transitive[eidx]:
-                            overlap = reach & self.elev_reachable[in_eidx]
-                            candidates |= overlap
+                            candidates |= self.elev_overlap[(eidx, in_eidx)]
 
             candidates.discard(cur_floor)
 
@@ -341,10 +362,14 @@ class ElevatorsProblem(search.Problem):
 
             eid = self.elevator_ids[eidx]
             for target in candidates:
-                new_floors = list(elev_floors)
-                new_floors[eidx] = target
+                # tuple-slice swap of one slot — faster than list+tuple
+                new_floors = (
+                    elev_floors[:eidx]
+                    + (target,)
+                    + elev_floors[eidx + 1:]
+                )
                 new_state = State(
-                    tuple(new_floors),
+                    new_floors,
                     person_locs,
                     last_move=(eidx, cur_floor),
                 )
@@ -372,11 +397,15 @@ class ElevatorsProblem(search.Problem):
                 if elev_load[eidx] + w > self.elev_capacity[eidx]:
                     continue
 
-                new_locs = list(person_locs)
-                new_locs[pidx] = self._encode_in_elev(eidx)
+                encoded = self._encode_in_elev(eidx)
+                new_locs = (
+                    person_locs[:pidx]
+                    + (encoded,)
+                    + person_locs[pidx + 1:]
+                )
                 new_state = State(
                     elev_floors,
-                    tuple(new_locs),
+                    new_locs,
                     last_move=None,                  # ENTER resets the lock
                 )
                 eid = self.elevator_ids[eidx]
@@ -394,11 +423,14 @@ class ElevatorsProblem(search.Problem):
             if ef not in self.useful_exit[pidx]:
                 continue
 
-            new_locs = list(person_locs)
-            new_locs[pidx] = ef
+            new_locs = (
+                person_locs[:pidx]
+                + (ef,)
+                + person_locs[pidx + 1:]
+            )
             new_state = State(
                 elev_floors,
-                tuple(new_locs),
+                new_locs,
                 last_move=None,                      # EXIT resets the lock
             )
             pid = self.person_ids[pidx]
