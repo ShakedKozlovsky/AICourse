@@ -328,11 +328,11 @@ class ElevatorsProblem(search.Problem):
                 g = self.person_goal[pidx]
 
                 if not self._loc_in_elev(loc):
-                    # person on floor `loc`
+                    # person on floor `loc` — only pickup is justified.
+                    # Anticipatory moves to p.goal are deferred (handled by
+                    # the delivery rule once p is inside this elevator).
                     if loc != g and loc in reach:
                         candidates.add(loc)         # potential pickup
-                    if loc != g and g in reach:
-                        candidates.add(g)            # anticipatory dropoff floor
                 else:
                     # person inside some elevator
                     in_eidx = self._eidx_from_loc(loc)
@@ -347,12 +347,10 @@ class ElevatorsProblem(search.Problem):
                                     continue
                                 if g in self.elev_transitive[other]:
                                     candidates |= self.elev_overlap[(eidx, other)]
-                    else:
-                        # passenger of another elevator that needs transfer:
-                        # we may anticipatorily position to receive them.
-                        if g not in self.elev_reachable[in_eidx] \
-                                and g in self.elev_transitive[eidx]:
-                            candidates |= self.elev_overlap[(eidx, in_eidx)]
+                    # Passengers of OTHER elevators are not our concern here
+                    # — when they exit at a transfer floor, the pickup rule
+                    # will see them as "person on floor" and add the floor
+                    # to our candidates at that point.
 
             candidates.discard(cur_floor)
 
