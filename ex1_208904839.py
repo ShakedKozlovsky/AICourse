@@ -32,21 +32,24 @@ class State:
                                     so the closed set treats physically-equal
                                     states as equal.
     """
-    __slots__ = ("elev_floors", "person_locs", "_last_move")
+    __slots__ = ("elev_floors", "person_locs", "_last_move", "_hash")
 
     def __init__(self, elev_floors, person_locs, last_move=None):
         self.elev_floors = elev_floors
         self.person_locs = person_locs
         self._last_move = last_move
+        # Pre-compute hash once at construction. State is never mutated
+        # after this, so the cached value is always correct.
+        self._hash = hash((elev_floors, person_locs))
 
     def __eq__(self, other):
-        if not isinstance(other, State):
-            return False
+        # The closed set only ever holds State objects, so a State<->State
+        # comparison is the only case we encounter.
         return (self.elev_floors == other.elev_floors
                 and self.person_locs == other.person_locs)
 
     def __hash__(self):
-        return hash((self.elev_floors, self.person_locs))
+        return self._hash
 
     def __repr__(self):
         return "State(floors=%s, persons=%s)" % (self.elev_floors,
@@ -88,6 +91,12 @@ class ElevatorsProblem(search.Problem):
             f0, w, g = persons[pid]
             self.person_weight.append(w)
             self.person_goal.append(g)
+
+        # Pre-compute the goal-state encoding of person_locs as a tuple.
+        # In a goal state, every person stands on their goal floor (loc >= 0
+        # equals goal_floor). person_locs == goal_locs_tuple iff goal reached
+        # — a single C-level tuple compare in goal_test.
+        self.goal_locs_tuple = tuple(self.person_goal)
 
         # ---- precompute static analyses --------------------------------- #
         # min_elev[f1][f2] = min number of distinct elevators needed to
@@ -288,26 +297,43 @@ class ElevatorsProblem(search.Problem):
         person_locs = state.person_locs
         last_move = state._last_move
 
-        n_elev = len(self.elevator_ids)
-        n_pers = len(self.person_ids)
+        # Cache attribute lookups in locals (faster than self.X in tight loops).
+        elev_ids = self.elevator_ids
+        person_ids = self.person_ids
+        person_goal = self.person_goal
+        person_weight = self.person_weight
+        elev_reachable = self.elev_reachable
+        elev_capacity = self.elev_capacity
+        elev_transitive = self.elev_transitive
+        elev_overlap = self.elev_overlap
+        useful_exit = self.useful_exit
 
-        # which persons sit in which elevator + load per elevator
+        n_elev = len(elev_ids)
+        n_pers = len(person_ids)
+
+        # ---- one-pass classification ----------------------------------- #
+        # on_floor_persons : list of (pidx, loc, goal) for persons standing
+        # in_elev_persons[e]: list of (pidx, goal) for passengers of elevator e
+        # elev_load[e]      : total weight inside elevator e
+        on_floor_persons = []
+        in_elev_persons = [[] for _ in range(n_elev)]
         elev_load = [0] * n_elev
-        passengers_of = [[] for _ in range(n_elev)]   # list of pidx
         for pidx in range(n_pers):
             loc = person_locs[pidx]
-            if self._loc_in_elev(loc):
-                eidx = self._eidx_from_loc(loc)
-                elev_load[eidx] += self.person_weight[pidx]
-                passengers_of[eidx].append(pidx)
+            g = person_goal[pidx]
+            if loc < 0:                              # inside an elevator
+                eidx = -loc - 1
+                in_elev_persons[eidx].append((pidx, g))
+                elev_load[eidx] += person_weight[pidx]
+            else:                                    # standing on a floor
+                on_floor_persons.append((pidx, loc, g))
 
-        # an elevator with a passenger at this elevator's current floor
-        # MUST exit before moving (pruning rule A).
+        # an elevator with a passenger AT its current floor must EXIT first
         elev_must_exit = [False] * n_elev
         for eidx in range(n_elev):
             ef = elev_floors[eidx]
-            for pidx in passengers_of[eidx]:
-                if self.person_goal[pidx] == ef:
+            for _, g in in_elev_persons[eidx]:
+                if g == ef:
                     elev_must_exit[eidx] = True
                     break
 
@@ -316,41 +342,28 @@ class ElevatorsProblem(search.Problem):
         # ----- MOVE actions ------------------------------------------------ #
         for eidx in range(n_elev):
             if elev_must_exit[eidx]:
-                continue  # must EXIT first — skip MOVE generation entirely
+                continue
             cur_floor = elev_floors[eidx]
-            reach = self.elev_reachable[eidx]
+            reach = elev_reachable[eidx]
 
-            # build candidate floor set (relevance pruning)
             candidates = set()
 
-            for pidx in range(n_pers):
-                loc = person_locs[pidx]
-                g = self.person_goal[pidx]
+            # pickup: floors of on-floor persons (not at goal) reachable by E
+            for _, loc, g in on_floor_persons:
+                if loc != g and loc in reach:
+                    candidates.add(loc)
 
-                if not self._loc_in_elev(loc):
-                    # person on floor `loc` — only pickup is justified.
-                    # Anticipatory moves to p.goal are deferred (handled by
-                    # the delivery rule once p is inside this elevator).
-                    if loc != g and loc in reach:
-                        candidates.add(loc)         # potential pickup
+            # delivery / transfer for own passengers
+            for _, g in in_elev_persons[eidx]:
+                if g in reach:
+                    candidates.add(g)
                 else:
-                    # person inside some elevator
-                    in_eidx = self._eidx_from_loc(loc)
-                    if in_eidx == eidx:
-                        # this elevator's own passenger
-                        if g in reach:
-                            candidates.add(g)        # delivery
-                        else:
-                            # transfer floors with elevators that can reach g
-                            for other in range(n_elev):
-                                if other == eidx:
-                                    continue
-                                if g in self.elev_transitive[other]:
-                                    candidates |= self.elev_overlap[(eidx, other)]
-                    # Passengers of OTHER elevators are not our concern here
-                    # — when they exit at a transfer floor, the pickup rule
-                    # will see them as "person on floor" and add the floor
-                    # to our candidates at that point.
+                    # transfer floors with elevators that reach g (transitively)
+                    for other in range(n_elev):
+                        if other == eidx:
+                            continue
+                        if g in elev_transitive[other]:
+                            candidates |= elev_overlap[(eidx, other)]
 
             candidates.discard(cur_floor)
 
@@ -358,83 +371,51 @@ class ElevatorsProblem(search.Problem):
             if last_move is not None and last_move[0] == eidx:
                 candidates.discard(last_move[1])
 
-            eid = self.elevator_ids[eidx]
+            eid = elev_ids[eidx]
+            prefix = elev_floors[:eidx]
+            suffix = elev_floors[eidx + 1:]
+            move_lock = (eidx, cur_floor)
             for target in candidates:
-                # tuple-slice swap of one slot — faster than list+tuple
-                new_floors = (
-                    elev_floors[:eidx]
-                    + (target,)
-                    + elev_floors[eidx + 1:]
-                )
-                new_state = State(
-                    new_floors,
-                    person_locs,
-                    last_move=(eidx, cur_floor),
-                )
-                action = "MOVE{%d,%d}" % (eid, target)
-                successors.append((action, new_state))
+                new_floors = prefix + (target,) + suffix
+                new_state = State(new_floors, person_locs, last_move=move_lock)
+                successors.append(("MOVE{%d,%d}" % (eid, target), new_state))
 
         # ----- ENTER actions ---------------------------------------------- #
-        for pidx in range(n_pers):
-            loc = person_locs[pidx]
-            if self._loc_in_elev(loc):
-                continue
-            g = self.person_goal[pidx]
+        for pidx, loc, g in on_floor_persons:
             if loc == g:
                 continue                              # already at goal
-            pid = self.person_ids[pidx]
-            w = self.person_weight[pidx]
-
+            pid = person_ids[pidx]
+            w = person_weight[pidx]
+            pre = person_locs[:pidx]
+            post = person_locs[pidx + 1:]
             for eidx in range(n_elev):
                 if elev_floors[eidx] != loc:
                     continue
-                # transitive reachability: this elevator must be able to
-                # eventually deliver the person
-                if g not in self.elev_transitive[eidx]:
+                if g not in elev_transitive[eidx]:
                     continue
-                if elev_load[eidx] + w > self.elev_capacity[eidx]:
+                if elev_load[eidx] + w > elev_capacity[eidx]:
                     continue
-
-                encoded = self._encode_in_elev(eidx)
-                new_locs = (
-                    person_locs[:pidx]
-                    + (encoded,)
-                    + person_locs[pidx + 1:]
+                encoded = -eidx - 1
+                new_locs = pre + (encoded,) + post
+                new_state = State(elev_floors, new_locs, last_move=None)
+                successors.append(
+                    ("ENTER{%d,%d}" % (pid, elev_ids[eidx]), new_state)
                 )
-                new_state = State(
-                    elev_floors,
-                    new_locs,
-                    last_move=None,                  # ENTER resets the lock
-                )
-                eid = self.elevator_ids[eidx]
-                action = "ENTER{%d,%d}" % (pid, eid)
-                successors.append((action, new_state))
 
         # ----- EXIT actions ----------------------------------------------- #
-        for pidx in range(n_pers):
-            loc = person_locs[pidx]
-            if not self._loc_in_elev(loc):
-                continue
-            eidx = self._eidx_from_loc(loc)
+        for eidx in range(n_elev):
             ef = elev_floors[eidx]
-            # only exit at useful floors (rule C)
-            if ef not in self.useful_exit[pidx]:
-                continue
-
-            new_locs = (
-                person_locs[:pidx]
-                + (ef,)
-                + person_locs[pidx + 1:]
-            )
-            new_state = State(
-                elev_floors,
-                new_locs,
-                last_move=None,                      # EXIT resets the lock
-            )
-            pid = self.person_ids[pidx]
-            eid = self.elevator_ids[eidx]
-            action = "EXIT{%d,%d}" % (pid, eid)
-            successors.append((action, new_state))
+            eid = elev_ids[eidx]
+            for pidx, g in in_elev_persons[eidx]:
+                if ef not in useful_exit[pidx]:
+                    continue
+                new_locs = (
+                    person_locs[:pidx] + (ef,) + person_locs[pidx + 1:]
+                )
+                new_state = State(elev_floors, new_locs, last_move=None)
+                successors.append(
+                    ("EXIT{%d,%d}" % (person_ids[pidx], eid), new_state)
+                )
 
         return successors
 
@@ -442,14 +423,12 @@ class ElevatorsProblem(search.Problem):
     # Required API: goal_test                                                #
     # --------------------------------------------------------------------- #
     def goal_test(self, state):
-        person_locs = state.person_locs
-        for pidx in range(len(self.person_ids)):
-            loc = person_locs[pidx]
-            if self._loc_in_elev(loc):
-                return False
-            if loc != self.person_goal[pidx]:
-                return False
-        return True
+        # Single tuple compare. Correct because:
+        #   - person on goal floor:   loc = goal_floor  -> equal
+        #   - person inside elevator: loc < 0 (encoded), goal_floor >= 0 -> not equal
+        #   - person on non-goal floor: loc != goal_floor -> not equal
+        # All three goal conditions reduce to person_locs == goal_locs_tuple.
+        return state.person_locs == self.goal_locs_tuple
 
     # --------------------------------------------------------------------- #
     # Required API: h_astar                                                  #
@@ -490,41 +469,40 @@ class ElevatorsProblem(search.Problem):
         elev_floors = state.elev_floors
         person_locs = state.person_locs
 
-        n_elev = len(self.elevator_ids)
+        # Cache attribute lookups in locals (faster than self.X in tight loops).
+        person_goal = self.person_goal
+        dist_to_goal = self.dist_to_goal
+        min_stints = self.min_stints_in_elev
+        elev_reach = self.elev_reachable
+
         INF = 10 ** 9
         h = 0
-        delivery = [set() for _ in range(n_elev)]
+        # Use a single set of (eidx, goal_floor) pairs instead of one set per
+        # elevator + a final summing loop. Same count, simpler.
+        delivery_pairs = set()
 
-        for pidx in range(len(self.person_ids)):
-            loc = person_locs[pidx]
-            g = self.person_goal[pidx]
+        for pidx, loc in enumerate(person_locs):
+            g = person_goal[pidx]
 
-            if not self._loc_in_elev(loc):
+            if loc >= 0:                              # on a floor
                 if loc == g:
                     continue
-                # .get() so an unreachable (loc -> g) yields INF instead of
-                # KeyError. INF propagates to h, signalling unreachability.
-                d = self.dist_to_goal[g].get(loc, INF)
+                d = dist_to_goal[g].get(loc, INF)
                 if d >= INF:
                     return INF
                 h += 2 * d
-            else:
-                eidx = self._eidx_from_loc(loc)
-                ef = elev_floors[eidx]
-                # use min_stints_in_elev (independent of ef) for consistency
-                stints = self.min_stints_in_elev[eidx].get(g, INF)
+            else:                                     # in an elevator
+                eidx = -loc - 1
+                stints = min_stints[eidx].get(g, INF)
                 if stints >= INF:
                     return INF
                 h += 2 * stints - 1
-                # contribute to delivery set only if E can deliver directly
-                # AND is not already at the goal floor
-                if g in self.elev_reachable[eidx] and ef != g:
-                    delivery[eidx].add(g)
+                # contribute to delivery only if E can deliver directly AND
+                # is not already at the goal floor
+                if g in elev_reach[eidx] and elev_floors[eidx] != g:
+                    delivery_pairs.add((eidx, g))
 
-        for eidx in range(n_elev):
-            h += len(delivery[eidx])
-
-        return h
+        return h + len(delivery_pairs)
 
 
 # --------------------------------------------------------------------------- #
