@@ -122,6 +122,13 @@ class ElevatorsProblem(search.Problem):
         # for every state.
         self._compute_elev_overlap()
 
+        # transfer_floors[eidx][g] = union, over every elevator OTHER than
+        # eidx whose transitive reach includes g, of the overlap floors with
+        # eidx. This lets the successor function answer "what floors should
+        # E move to so a passenger heading to g can transfer?" via a single
+        # dict lookup instead of an inner loop over all elevators.
+        self._compute_transfer_floors()
+
         # ---- build initial state ---------------------------------------- #
         elev_floors = tuple(elevators[eid][0] for eid in self.elevator_ids)
         person_locs = tuple(persons[pid][0] for pid in self.person_ids)
@@ -272,6 +279,32 @@ class ElevatorsProblem(search.Problem):
                     self.elev_reachable[i] & self.elev_reachable[j]
                 )
 
+    def _compute_transfer_floors(self):
+        """
+        transfer_floors[eidx][g] = set of floors elevator `eidx` can move to
+        so that a passenger heading to `g` (whose goal is NOT in eidx.reach)
+        can be handed off to some other elevator whose transitive reach
+        contains `g`. Precomputing this collapses an O(E)-per-passenger inner
+        loop in successor into a single dict lookup.
+
+        Only computed for goals that appear in `Persons`.
+        """
+        n = len(self.elevator_ids)
+        self.transfer_floors = [dict() for _ in range(n)]
+        goal_set = set(self.person_goal)
+        for eidx in range(n):
+            for g in goal_set:
+                # only relevant when g is NOT directly reachable by eidx
+                if g in self.elev_reachable[eidx]:
+                    continue
+                acc = set()
+                for other in range(n):
+                    if other == eidx:
+                        continue
+                    if g in self.elev_transitive[other]:
+                        acc |= self.elev_overlap[(eidx, other)]
+                self.transfer_floors[eidx][g] = frozenset(acc)
+
     # --------------------------------------------------------------------- #
     # Helpers                                                                #
     # --------------------------------------------------------------------- #
@@ -305,7 +338,7 @@ class ElevatorsProblem(search.Problem):
         elev_reachable = self.elev_reachable
         elev_capacity = self.elev_capacity
         elev_transitive = self.elev_transitive
-        elev_overlap = self.elev_overlap
+        transfer_floors = self.transfer_floors
         useful_exit = self.useful_exit
 
         n_elev = len(elev_ids)
@@ -347,23 +380,25 @@ class ElevatorsProblem(search.Problem):
             reach = elev_reachable[eidx]
 
             candidates = set()
+            elev_trans = elev_transitive[eidx]
 
-            # pickup: floors of on-floor persons (not at goal) reachable by E
+            # pickup: floors of on-floor persons (not at goal) reachable by E,
+            # AND whose goal is reachable by E via some chain of elevators.
+            # If g is not in E.transitive, ENTER would be rejected anyway, so
+            # MOVING here for pickup is wasted (deferred-form argument: any
+            # legitimate use of MOVE(E, loc) comes from another rule below).
             for _, loc, g in on_floor_persons:
-                if loc != g and loc in reach:
+                if loc != g and loc in reach and g in elev_trans:
                     candidates.add(loc)
 
             # delivery / transfer for own passengers
+            tf_for_e = transfer_floors[eidx]
             for _, g in in_elev_persons[eidx]:
                 if g in reach:
                     candidates.add(g)
                 else:
-                    # transfer floors with elevators that reach g (transitively)
-                    for other in range(n_elev):
-                        if other == eidx:
-                            continue
-                        if g in elev_transitive[other]:
-                            candidates |= elev_overlap[(eidx, other)]
+                    # precomputed: floors E can move to to set up a transfer
+                    candidates |= tf_for_e[g]
 
             candidates.discard(cur_floor)
 
