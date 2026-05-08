@@ -384,14 +384,25 @@ class ElevatorsProblem(search.Problem):
         for eidx in range(n_elev):
             if elev_must_exit[eidx]:
                 continue
+            # Strong MOVE-cycle pruning: two consecutive MOVEs of the same
+            # elevator with no ENTER/EXIT between them are dominated by a
+            # single MOVE to the final destination (each MOVE = 1 action,
+            # reaches any reachable floor). So skip ALL MOVE generation for
+            # this elevator if the most recent action was its own MOVE.
+            if la_kind == 'M' and last_action[1] == eidx:
+                continue
             cur_floor = elev_floors[eidx]
             reach = elev_reachable[eidx]
+            elev_trans = elev_transitive[eidx]
 
             candidates = set()
 
-            # pickup: floors of on-floor persons (not at goal) reachable by E
+            # pickup: floors of on-floor persons (not at goal) reachable by E,
+            # AND whose goal is in E's transitive reach. If g not in
+            # transitive, ENTER would be rejected anyway, so MOVE-to-pickup
+            # is wasted (R1 — deferred-form argument).
             for _, loc, g in on_floor_persons:
-                if loc != g and loc in reach:
+                if loc != g and loc in reach and g in elev_trans:
                     candidates.add(loc)
 
             # delivery / transfer for own passengers
@@ -404,12 +415,6 @@ class ElevatorsProblem(search.Problem):
                     candidates |= tf_for_e[g]
 
             candidates.discard(cur_floor)
-
-            # block immediate MOVE-back (cycle pruning for MOVE):
-            # last_action ('M', eidx, prev_floor) means we just moved
-            # this elevator from prev_floor; reversing is a no-op cycle.
-            if la_kind == 'M' and last_action[1] == eidx:
-                candidates.discard(last_action[2])
 
             eid = elev_ids[eidx]
             prefix = elev_floors[:eidx]
