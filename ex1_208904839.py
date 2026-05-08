@@ -27,17 +27,22 @@ class State:
                                        loc >= 0 -> standing on floor `loc`
                                        loc <  0 -> inside elevator with idx
                                                    eidx = -loc - 1
-      _last_move   : tuple|None   — (eidx, prev_floor) of the last MOVE since
-                                    the last ENTER/EXIT. EXCLUDED from hash/eq
-                                    so the closed set treats physically-equal
-                                    states as equal.
+      _last_action : tuple|None   — identity of the action that produced this
+                                    state. EXCLUDED from hash/eq so the closed
+                                    set treats physically-equal states as
+                                    equal. Used by successor() to skip
+                                    immediate reversals:
+                                       ('M', eidx, prev_floor)
+                                       ('E', pidx, eidx)
+                                       ('X', pidx, eidx)
+                                        None  (initial state)
     """
-    __slots__ = ("elev_floors", "person_locs", "_last_move", "_hash")
+    __slots__ = ("elev_floors", "person_locs", "_last_action", "_hash")
 
-    def __init__(self, elev_floors, person_locs, last_move=None):
+    def __init__(self, elev_floors, person_locs, last_action=None):
         self.elev_floors = elev_floors
         self.person_locs = person_locs
-        self._last_move = last_move
+        self._last_action = last_action
         # Pre-compute hash once at construction. State is never mutated
         # after this, so the cached value is always correct.
         self._hash = hash((elev_floors, person_locs))
@@ -132,7 +137,7 @@ class ElevatorsProblem(search.Problem):
         # ---- build initial state ---------------------------------------- #
         elev_floors = tuple(elevators[eid][0] for eid in self.elevator_ids)
         person_locs = tuple(persons[pid][0] for pid in self.person_ids)
-        initial_state = State(elev_floors, person_locs, last_move=None)
+        initial_state = State(elev_floors, person_locs, last_action=None)
 
         search.Problem.__init__(self, initial_state)
 
@@ -328,7 +333,7 @@ class ElevatorsProblem(search.Problem):
     def successor(self, state):
         elev_floors = state.elev_floors
         person_locs = state.person_locs
-        last_move = state._last_move
+        last_action = state._last_action  # ('M', eidx, prev_floor) | ('E', pidx, eidx) | ('X', pidx, eidx) | None
 
         # Cache attribute lookups in locals (faster than self.X in tight loops).
         elev_ids = self.elevator_ids
@@ -343,6 +348,9 @@ class ElevatorsProblem(search.Problem):
 
         n_elev = len(elev_ids)
         n_pers = len(person_ids)
+
+        # decode last_action so we can check it cheaply later
+        la_kind = last_action[0] if last_action is not None else None
 
         # ---- one-pass classification ----------------------------------- #
         # on_floor_persons : list of (pidx, loc, goal) for persons standing
@@ -380,15 +388,10 @@ class ElevatorsProblem(search.Problem):
             reach = elev_reachable[eidx]
 
             candidates = set()
-            elev_trans = elev_transitive[eidx]
 
-            # pickup: floors of on-floor persons (not at goal) reachable by E,
-            # AND whose goal is reachable by E via some chain of elevators.
-            # If g is not in E.transitive, ENTER would be rejected anyway, so
-            # MOVING here for pickup is wasted (deferred-form argument: any
-            # legitimate use of MOVE(E, loc) comes from another rule below).
+            # pickup: floors of on-floor persons (not at goal) reachable by E
             for _, loc, g in on_floor_persons:
-                if loc != g and loc in reach and g in elev_trans:
+                if loc != g and loc in reach:
                     candidates.add(loc)
 
             # delivery / transfer for own passengers
@@ -402,17 +405,22 @@ class ElevatorsProblem(search.Problem):
 
             candidates.discard(cur_floor)
 
-            # block immediate move-back (rule F via _last_move)
-            if last_move is not None and last_move[0] == eidx:
-                candidates.discard(last_move[1])
+            # block immediate MOVE-back (cycle pruning for MOVE):
+            # last_action ('M', eidx, prev_floor) means we just moved
+            # this elevator from prev_floor; reversing is a no-op cycle.
+            if la_kind == 'M' and last_action[1] == eidx:
+                candidates.discard(last_action[2])
 
             eid = elev_ids[eidx]
             prefix = elev_floors[:eidx]
             suffix = elev_floors[eidx + 1:]
-            move_lock = (eidx, cur_floor)
             for target in candidates:
                 new_floors = prefix + (target,) + suffix
-                new_state = State(new_floors, person_locs, last_move=move_lock)
+                new_state = State(
+                    new_floors,
+                    person_locs,
+                    last_action=('M', eidx, cur_floor),
+                )
                 successors.append(("MOVE{%d,%d}" % (eid, target), new_state))
 
         # ----- ENTER actions ---------------------------------------------- #
@@ -430,9 +438,18 @@ class ElevatorsProblem(search.Problem):
                     continue
                 if elev_load[eidx] + w > elev_capacity[eidx]:
                     continue
+                # block immediate ENTER undoing the previous EXIT:
+                # last_action ('X', pidx, eidx) means p just exited E here,
+                # re-entering would put us back at the pre-EXIT state.
+                if la_kind == 'X' and last_action[1] == pidx and last_action[2] == eidx:
+                    continue
                 encoded = -eidx - 1
                 new_locs = pre + (encoded,) + post
-                new_state = State(elev_floors, new_locs, last_move=None)
+                new_state = State(
+                    elev_floors,
+                    new_locs,
+                    last_action=('E', pidx, eidx),
+                )
                 successors.append(
                     ("ENTER{%d,%d}" % (pid, elev_ids[eidx]), new_state)
                 )
@@ -444,10 +461,20 @@ class ElevatorsProblem(search.Problem):
             for pidx, g in in_elev_persons[eidx]:
                 if ef not in useful_exit[pidx]:
                     continue
+                # block immediate EXIT undoing the previous ENTER:
+                # last_action ('E', pidx, eidx) means p just entered E here,
+                # exiting now puts p back on the same floor → identical to
+                # pre-ENTER state.
+                if la_kind == 'E' and last_action[1] == pidx and last_action[2] == eidx:
+                    continue
                 new_locs = (
                     person_locs[:pidx] + (ef,) + person_locs[pidx + 1:]
                 )
-                new_state = State(elev_floors, new_locs, last_move=None)
+                new_state = State(
+                    elev_floors,
+                    new_locs,
+                    last_action=('X', pidx, eidx),
+                )
                 successors.append(
                     ("EXIT{%d,%d}" % (person_ids[pidx], eid), new_state)
                 )
