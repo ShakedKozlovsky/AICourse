@@ -439,6 +439,14 @@ class ElevatorsProblem(search.Problem):
             for eidx in range(n_elev):
                 if elev_floors[eidx] != loc:
                     continue
+                # Force EXIT before ENTER when this elevator has any
+                # passenger AT their goal floor: any optimal plan can be
+                # rearranged to do the at-goal EXIT first (proved by the
+                # swap-commute argument; ENTER and EXIT of different persons
+                # at the same floor commute, and capacity in the swapped
+                # plan is no stricter).
+                if elev_must_exit[eidx]:
+                    continue
                 if g not in elev_transitive[eidx]:
                     continue
                 if elev_load[eidx] + w > elev_capacity[eidx]:
