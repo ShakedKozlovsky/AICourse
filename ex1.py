@@ -84,9 +84,14 @@ class ElevatorsProblem(search.Problem):
         # static elevator info (indexed by eidx)
         self.elev_reachable = []   # list[frozenset[int]]
         self.elev_capacity = []    # list[int]
+        # An elevator's starting floor may not be in its reachable set
+        # (one-way elevators). Include it so overlap/transitive computations
+        # see the initial transfer opportunity.
+        self.elev_reachable_plus_start = []
         for eid in self.elevator_ids:
             f0, reachable, wmax = elevators[eid]
             self.elev_reachable.append(frozenset(reachable))
+            self.elev_reachable_plus_start.append(frozenset(reachable) | {f0})
             self.elev_capacity.append(wmax)
 
         # static person info (indexed by pidx)
@@ -156,16 +161,13 @@ class ElevatorsProblem(search.Problem):
 
         Scales with O(|goals| * (F + edges)) instead of O(F^3).
         """
-        # only build adjacency over floors that any elevator actually
-        # touches (irrelevant floors never appear in any state we'll query)
         relevant_floors = set()
-        for reach in self.elev_reachable:
+        for reach in self.elev_reachable_plus_start:
             relevant_floors |= reach
-        # also include person start floors and goals so lookups never miss
         relevant_floors.update(self.person_goal)
 
         adj = {f: set() for f in relevant_floors}
-        for reach in self.elev_reachable:
+        for reach in self.elev_reachable_plus_start:
             reach_list = list(reach)
             for i in range(len(reach_list)):
                 a = reach_list[i]
@@ -200,7 +202,7 @@ class ElevatorsProblem(search.Problem):
         e_adj = [set() for _ in range(n)]
         for i in range(n):
             for j in range(i + 1, n):
-                if self.elev_reachable[i] & self.elev_reachable[j]:
+                if self.elev_reachable_plus_start[i] & self.elev_reachable_plus_start[j]:
                     e_adj[i].add(j)
                     e_adj[j].add(i)
 
@@ -208,13 +210,13 @@ class ElevatorsProblem(search.Problem):
         for i in range(n):
             visited = {i}
             q = deque([i])
-            union = set(self.elev_reachable[i])
+            union = set(self.elev_reachable_plus_start[i])
             while q:
                 u = q.popleft()
                 for v in e_adj[u]:
                     if v not in visited:
                         visited.add(v)
-                        union |= self.elev_reachable[v]
+                        union |= self.elev_reachable_plus_start[v]
                         q.append(v)
             self.elev_transitive.append(frozenset(union))
 
@@ -232,7 +234,7 @@ class ElevatorsProblem(search.Problem):
             useful = {g}
             for eidx2 in range(len(self.elevator_ids)):
                 if g in self.elev_transitive[eidx2]:
-                    useful |= self.elev_reachable[eidx2]
+                    useful |= self.elev_reachable_plus_start[eidx2]
             self.useful_exit.append(frozenset(useful))
 
     def _compute_min_stints_in_elev(self):
@@ -281,7 +283,7 @@ class ElevatorsProblem(search.Problem):
                 if i == j:
                     continue
                 self.elev_overlap[(i, j)] = (
-                    self.elev_reachable[i] & self.elev_reachable[j]
+                    self.elev_reachable[i] & self.elev_reachable_plus_start[j]
                 )
 
     def _compute_transfer_floors(self):
