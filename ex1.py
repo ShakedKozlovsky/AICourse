@@ -579,7 +579,13 @@ class ElevatorsProblem(search.Problem):
                 if g in elev_reach[eidx] and elev_floors[eidx] != g:
                     delivery_pairs.add((eidx, g))
 
-        return h + len(delivery_pairs)
+        # Tiebreaker: prefer states with more delivered persons.
+        # Subtracting epsilon keeps h strictly admissible (h ≤ h*)
+        # since we only make h smaller. The assignment requires
+        # admissibility only, not consistency.
+        n_delivered = sum(1 for pidx in range(len(person_locs))
+                         if person_locs[pidx] == person_goal[pidx])
+        return h + len(delivery_pairs) - 0.0001 * n_delivered
 
 
 # --------------------------------------------------------------------------- #
