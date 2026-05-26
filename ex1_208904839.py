@@ -554,38 +554,38 @@ class ElevatorsProblem(search.Problem):
 
         INF = 10 ** 9
         h = 0
-        # Use a single set of (eidx, goal_floor) pairs instead of one set per
-        # elevator + a final summing loop. Same count, simpler.
         delivery_pairs = set()
+        delivery_floors = set()
+        pickup_floors = set()
+        elev_floor_set = set(elev_floors)
+        n_delivered = 0
 
-        for pidx, loc in enumerate(person_locs):
+        for pidx in range(len(person_locs)):
+            loc = person_locs[pidx]
             g = person_goal[pidx]
 
-            if loc >= 0:                              # on a floor
+            if loc >= 0:
                 if loc == g:
+                    n_delivered += 1
                     continue
                 d = dist_to_goal[g].get(loc, INF)
                 if d >= INF:
                     return INF
                 h += 2 * d
-            else:                                     # in an elevator
+                if loc not in elev_floor_set:
+                    pickup_floors.add(loc)
+            else:
                 eidx = -loc - 1
                 stints = min_stints[eidx].get(g, INF)
                 if stints >= INF:
                     return INF
                 h += 2 * stints - 1
-                # contribute to delivery only if E can deliver directly AND
-                # is not already at the goal floor
                 if g in elev_reach[eidx] and elev_floors[eidx] != g:
                     delivery_pairs.add((eidx, g))
+                    delivery_floors.add(g)
 
-        # Tiebreaker: prefer states with more delivered persons.
-        # Subtracting epsilon keeps h strictly admissible (h ≤ h*)
-        # since we only make h smaller. The assignment requires
-        # admissibility only, not consistency.
-        n_delivered = sum(1 for pidx in range(len(person_locs))
-                         if person_locs[pidx] == person_goal[pidx])
-        return h + len(delivery_pairs) - 0.0001 * n_delivered
+        extra_pickup = len(pickup_floors - delivery_floors)
+        return h + len(delivery_pairs) + extra_pickup - 0.0001 * n_delivered
 
 
 # --------------------------------------------------------------------------- #
