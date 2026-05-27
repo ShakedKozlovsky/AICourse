@@ -550,6 +550,12 @@ class ElevatorsProblem(search.Problem):
         pickup_floors = set()
         elev_floor_set = set(elev_floors)
         n_delivered = 0
+        n_elev = len(self.elevator_ids)
+        transfer_fl = self.transfer_floors
+
+        # Per-elevator: union of transfer floors for transfer-needing passengers
+        elev_transfer_union = [set() for _ in range(n_elev)]
+        elev_has_transfer = [False] * n_elev
 
         for pidx in range(len(person_locs)):
             loc = person_locs[pidx]
@@ -574,9 +580,22 @@ class ElevatorsProblem(search.Problem):
                 if g in elev_reach[eidx] and elev_floors[eidx] != g:
                     delivery_pairs.add((eidx, g))
                     delivery_floors.add(g)
+                elif g not in elev_reach[eidx]:
+                    tf = transfer_fl[eidx].get(g, frozenset())
+                    if tf:
+                        elev_has_transfer[eidx] = True
+                        elev_transfer_union[eidx] |= tf
 
         extra_pickup = len(pickup_floors - delivery_floors)
-        return h + len(delivery_pairs) + extra_pickup - 0.0001 * n_delivered
+
+        # Per-elevator transfer: if ALL transfer floor options are uncovered
+        # by delivery, pickup, or current position, E needs 1 extra MOVE.
+        covered = delivery_floors | pickup_floors | elev_floor_set
+        transfer_extra = sum(1 for eidx in range(n_elev)
+                             if elev_has_transfer[eidx]
+                             and not (elev_transfer_union[eidx] & covered))
+
+        return h + len(delivery_pairs) + extra_pickup + transfer_extra - 0.0001 * n_delivered
 
 
 # --------------------------------------------------------------------------- #
