@@ -122,8 +122,8 @@ class ElevatorsProblem(search.Problem):
         # min_stints_in_elev[eidx][g] = min number of elevator-stints a
         # person needs given they are CURRENTLY inside elevator eidx and
         # heading to floor g. Independent of the elevator's current floor —
-        # this is what makes the per-person heuristic component CONSISTENT
-        # under MOVE actions (h_p does not change when the elevator moves).
+        # Independent of the elevator's current floor, so the per-person
+        # component does not change when the elevator moves.
         self._compute_min_stints_in_elev()
 
         # elev_overlap[(i, j)] = frozenset of floors reachable by BOTH
@@ -512,35 +512,26 @@ class ElevatorsProblem(search.Problem):
     # --------------------------------------------------------------------- #
     def h_astar(self, node):
         """
-        Admissible AND consistent heuristic.
+        Admissible heuristic.
 
-        Sums two disjoint lower bounds (different action types -> no overlap):
+        Sums three disjoint lower bounds:
 
         (1) Per-person ENTER+EXIT lower bound:
               - on floor at goal           : 0
               - on floor not at goal       : 2 * min_elev[f][g]
               - in elevator E              : 2 * min_stints_in_elev[E][g] - 1
-            (min_stints_in_elev is independent of E's current floor, which
-            keeps the heuristic CONSISTENT across MOVE actions.)
 
         (2) Per-elevator delivery-MOVE lower bound:
               for each elevator E, count distinct passenger goals that are
               reachable by E and differ from E's current floor.
 
-        Admissibility: each ENTER and EXIT is a separate, non-shared action
-        belonging to exactly one person; each delivery-MOVE is a distinct
-        floor-visit by exactly one elevator. No double counting.
+        (3) Pickup-floor MOVE lower bound:
+              count floors where a person waits with no elevator present,
+              excluding floors already counted as delivery targets.
 
-        Consistency (h(s) <= 1 + h(s')) under each action:
-          MOVE   : per-person component unchanged (min_stints independent
-                   of E.floor); delivery set changes by at most 1 entry
-                   (one floor per MOVE). |Delta h| <= 1.
-          ENTER  : per-person h_p drops by exactly 1 in the best case (when
-                   entering an optimal first elevator); delivery may rise by
-                   at most 1; net change >= 0.
-          EXIT   : per-person h_p increases (or matches) by 1 when exiting
-                   at an optimal floor; delivery loses at most 1; net change
-                   >= 0 in the best case.
+        (4) Tiebreaker: subtract 0.0001 per delivered person to prefer
+              states closer to the goal among equal integer h values.
+              Only subtracts from h, so cannot break admissibility.
         """
         state = node.state
         elev_floors = state.elev_floors
