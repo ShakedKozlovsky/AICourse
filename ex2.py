@@ -287,10 +287,14 @@ class Controller:
             p = self.elev_prob[eidx]
             ef_s = list(ef); ef_s[eidx] = target
             outs = [(p, (tuple(ef_s), pl), 0.0)]
-            others = [f for f in self.elev_reachable[eidx] if f != target]
-            if others:
-                pf = (1.0 - p) / len(others)
-                for f in others:
+            # PDF failure distribution: uniform over {f0} ∪ (F_e \ {target}).
+            # In standard problems f0 ∈ F so the union is redundant; this set
+            # form also covers the case where the start floor is not in F.
+            others_set = set(self.elev_reachable[eidx]) - {target}
+            others_set.add(ef[eidx])
+            if others_set:
+                pf = (1.0 - p) / len(others_set)
+                for f in sorted(others_set):
                     ef_f = list(ef); ef_f[eidx] = f
                     outs.append((pf, (tuple(ef_f), pl), 0.0))
             return outs
