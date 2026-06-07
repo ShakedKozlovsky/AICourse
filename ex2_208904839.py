@@ -25,12 +25,6 @@ from collections import deque
 
 id = ["208904839"]
 
-# Cache of solved MDP policies, keyed by a signature derived purely from
-# the documented GameAPI getters. The optimal policy depends only on the
-# problem structure (identical across seeds), so this memoises our own
-# value-iteration result. Holds the most recent problem only.
-_MDP_CACHE = {}
-
 
 # --------------------------------------------------------------------------- #
 # Internal deterministic planning state (used by inner A*).                   #
@@ -320,32 +314,9 @@ class Controller:
             return [(q, (ef, tuple(pl_s)), 0.0), (1.0 - q, state, 0.0)]
         return [(1.0, state, 0.0)]
 
-    def _problem_signature(self):
-        return (
-            tuple(self.elevator_ids),
-            tuple(tuple(sorted(r)) for r in self.elev_reachable),
-            tuple(self.elev_capacity),
-            tuple(self.elev_prob),
-            tuple(self.person_ids),
-            tuple(self.person_weight),
-            tuple(self.person_goal),
-            tuple(self.person_prob),
-            tuple(self.person_mean_reward),
-            self.goal_reward,
-            self.max_steps,
-            self._mdp_init_state,
-        )
-
     def _try_build_mdp(self):
         self._mdp_init_state = self._mdp_encode(self._initial_state)
         horizon = self.max_steps
-        sig = self._problem_signature()
-        cached = _MDP_CACHE.get(sig, "MISS")
-        if cached is False:
-            return  # known too-large → A* path
-        if cached != "MISS":
-            self._mdp_V, self._mdp_state_to_idx = cached
-            return
         # Wall-clock safety: abort to A* if the build approaches the
         # per-seed time limit (20 + 0.5*horizon), so a slow machine can
         # never blow the budget. Use a conservative 0.5 fraction.
@@ -362,18 +333,12 @@ class Controller:
                     if ns not in seen:
                         seen.add(ns)
                         if len(seen) > cap:
-                            _MDP_CACHE.clear()
-                            _MDP_CACHE[sig] = False
                             return  # too large → keep A* path
                         frontier.append(ns)
         # Time-budget gate: estimated build vs (20 + 0.5*horizon) limit.
         if len(seen) * horizon > 35_000 * (20 + 0.5 * horizon):
-            _MDP_CACHE.clear()
-            _MDP_CACHE[sig] = False
             return
         if time.perf_counter() > deadline:
-            _MDP_CACHE.clear()
-            _MDP_CACHE[sig] = False
             return
         states = list(seen)
         state_to_idx = {s: i for i, s in enumerate(states)}
@@ -396,8 +361,6 @@ class Controller:
         V_layers = [V_prev]
         for _t in range(1, horizon + 1):
             if time.perf_counter() > deadline:
-                _MDP_CACHE.clear()
-                _MDP_CACHE[sig] = False
                 return  # build too slow on this machine → A* path
             V_cur = [0.0] * n
             for idx in range(n):
@@ -413,8 +376,6 @@ class Controller:
             V_prev = V_cur
         self._mdp_V = V_layers
         self._mdp_state_to_idx = state_to_idx
-        _MDP_CACHE.clear()
-        _MDP_CACHE[sig] = (V_layers, state_to_idx)
 
     def _mdp_choose(self, a2_state):
         remaining = self.max_steps - self.game.get_current_steps()
