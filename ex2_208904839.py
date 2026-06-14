@@ -1,26 +1,15 @@
 """
-AI Course - Assignment 2: Stochastic Multi-Elevator Passenger
-Bar-Ilan CS 89-570
-
 AI disclosure:
-  Used: Claude Code for brainstorming controller strategies, discussing the
-  MDP formulation, and discussing admissibility/consistency of the inner A*
-  heuristic. The code was written by Claude. I (Shaked) directed the design
-  through discussion, verified correctness against the specification, ran the
-  local checker, and validated the implementation.
-
-Architecture: a hybrid policy.
-  - When the reachable state space is small enough to solve within the time
-    budget, an EXACT finite-horizon MDP policy is computed by backward
-    induction (value iteration). This maximises expected total reward and
-    handles defective elevators / reset timing optimally.
-  - For larger problems, the controller falls back to cost-shaped A* replan
-    with lazy plan following.
+  Used: Claude Code for brainstorming controller strategies and discussing
+  the MDP formulation. The code was written by Claude. I (Shaked) directed
+  the design through discussion, verified correctness against the
+  specification, ran the local checker, and validated the implementation.
 """
 
 import ext_elev
 import heapq
 import time
+import numpy as np
 from collections import deque
 
 id = ["208904839"]
@@ -54,12 +43,16 @@ class _PlanState:
 class Controller:
     """Stochastic multi-elevator controller.
 
-    Architecture: cost-shaped FF-replan with lazy plan following.
-      1. In __init__: read static info, precompute analyses, run A* once.
-      2. choose_next_action: if last action succeeded (state matches the
-         expected next-state), advance the cached plan; otherwise replan.
-      3. Before returning an action, compare against RESET via a
-         lightweight Q estimate.
+    Two engines, chosen at __init__ time based on the reachable state
+    space size (and the per-seed time budget):
+
+      * Exact MDP (finite-horizon value iteration, numpy-vectorised) when
+        the reachable state space fits the time budget. Optimal in
+        expectation; the policy table is looked up at each step in O(1).
+
+      * Cost-shaped A* with lazy plan following + replan on divergence,
+        for larger state spaces. Subset-strategy picker chooses the best
+        delivery target at __init__ to handle reset-loop instances.
     """
 
     # ----------------------------------------------------------------- #
@@ -317,13 +310,11 @@ class Controller:
     def _try_build_mdp(self):
         self._mdp_init_state = self._mdp_encode(self._initial_state)
         horizon = self.max_steps
-        # Wall-clock safety: abort to A* if the build approaches the
-        # per-seed time limit (20 + 0.5*horizon), so a slow machine can
-        # never blow the budget. Use a conservative 0.5 fraction.
+        budget = 20.0 + 0.5 * horizon
         build_start = time.perf_counter()
-        deadline = build_start + 0.5 * (20.0 + 0.5 * horizon)
-        # BFS over reachable states, capped so huge problems abort fast.
-        cap = 40_000
+        deadline = build_start + 0.8 * budget
+        NUMPY_CAP = 500_000
+        bfs_cap = min(NUMPY_CAP, 25_000_000 // max(horizon, 1))
         seen = {self._mdp_init_state}
         frontier = deque([self._mdp_init_state])
         while frontier:
@@ -332,46 +323,59 @@ class Controller:
                 for _p, ns, _r in self._mdp_outcomes(s, a):
                     if ns not in seen:
                         seen.add(ns)
-                        if len(seen) > cap:
-                            return  # too large → keep A* path
+                        if len(seen) > bfs_cap:
+                            return
                         frontier.append(ns)
-        # Time-budget gate: estimated build vs (20 + 0.5*horizon) limit.
-        if len(seen) * horizon > 35_000 * (20 + 0.5 * horizon):
-            return
         if time.perf_counter() > deadline:
             return
-        states = list(seen)
+        n = len(seen)
+        if n * horizon > 25_000_000:
+            return
+        self._build_numpy_mdp(list(seen), deadline)
+
+    def _build_numpy_mdp(self, states, deadline):
+        horizon = self.max_steps
         state_to_idx = {s: i for i, s in enumerate(states)}
-        n = len(states)
-        # Precompute transitions as (imm_reward, [(next_idx, prob), ...]).
-        trans = []
+        n_states = len(states)
+        action_offset_list = [0]
+        sa_imm_list = []
+        sa_outcome_offset_list = [0]
+        out_next_list = []
+        out_prob_list = []
+        sa_total = 0
+        out_total = 0
         for s in states:
             acts = self._mdp_legal_actions(s)
-            per_state = []
             for a in acts:
+                outs = self._mdp_outcomes(s, a)
                 imm = 0.0
-                nexts = []
-                for prob, ns, r in self._mdp_outcomes(s, a):
+                for prob, ns, r in outs:
+                    out_next_list.append(state_to_idx[ns])
+                    out_prob_list.append(prob)
                     imm += prob * r
-                    nexts.append((state_to_idx[ns], prob))
-                per_state.append((imm, nexts))
-            trans.append(per_state)
-        # Backward induction. V_prev = V at t-1; build V layers 1..horizon.
-        V_prev = [0.0] * n
+                    out_total += 1
+                sa_imm_list.append(imm)
+                sa_outcome_offset_list.append(out_total)
+                sa_total += 1
+            action_offset_list.append(sa_total)
+        if time.perf_counter() > deadline:
+            return
+        sa_imm = np.array(sa_imm_list, dtype=np.float64)
+        out_next = np.array(out_next_list, dtype=np.int32)
+        out_prob = np.array(out_prob_list, dtype=np.float64)
+        sa_outcome_offset = np.array(sa_outcome_offset_list, dtype=np.int64)
+        action_offset = np.array(action_offset_list, dtype=np.int64)
+        V_prev = np.zeros(n_states, dtype=np.float64)
         V_layers = [V_prev]
+        sa_starts = sa_outcome_offset[:-1]
+        action_starts = action_offset[:-1]
         for _t in range(1, horizon + 1):
             if time.perf_counter() > deadline:
-                return  # build too slow on this machine → A* path
-            V_cur = [0.0] * n
-            for idx in range(n):
-                best = -1.0
-                for imm, nexts in trans[idx]:
-                    q = imm
-                    for nidx, prob in nexts:
-                        q += prob * V_prev[nidx]
-                    if q > best:
-                        best = q
-                V_cur[idx] = best
+                return
+            contrib = out_prob * V_prev[out_next]
+            sa_future = np.add.reduceat(contrib, sa_starts)
+            Q = sa_imm + sa_future
+            V_cur = np.maximum.reduceat(Q, action_starts)
             V_layers.append(V_cur)
             V_prev = V_cur
         self._mdp_V = V_layers
