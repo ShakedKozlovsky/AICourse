@@ -75,8 +75,10 @@ class Controller:
     _TIME_BUDGET_GATE = 0.55       # stop replanning once we burned this much
     _HARD_STOP_FRAC = 0.92         # past this, return a safe action immediately
     _SHIFT_TRIGGER = 0.10          # |Delta p| trigger for surprise replan
-    _PRIOR_ALPHA = 2.0             # Beta(2, 1) -> mean 0.667, modest optimism
-    _PRIOR_BETA = 1.0
+    _PRIOR_ALPHA = 3.0             # Beta(3, 1) -> mean 0.75, optimism close
+    _PRIOR_BETA = 1.0              # to easy-tier truth (0.95) without hiding
+                                   # broken elevators (0.30) for long
+
     _REWARD_PRIOR = 5.0            # placeholder mean until first delivery
     _REWARD_SAMPLES_CAP = 50
     _MIN_REPLAN_INTERVAL = 10      # min steps between consecutive replans
@@ -131,8 +133,8 @@ class Controller:
         self._last_plan_e = None
         self._last_plan_p = None
         self._last_plan_r = None        # snapshot of mean rewards at last plan
-        self._next_replan_step = 15
-        self._replan_gates = [15, 40, 100]
+        self._next_replan_step = 10
+        self._replan_gates = [10, 30, 80]
         self._mdp_too_big = False
         # Cached reachable-state list + structure tensors. Topology never
         # changes within a seed (probabilities change, the graph doesn't),
