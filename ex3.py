@@ -385,11 +385,28 @@ class Controller:
     # ----------------------------------------------------------------- #
     # Tier 1 -- MDP build + stationary discounted VI                     #
     # ----------------------------------------------------------------- #
+    # Outcome type codes (kept as small int constants for fast indexing).
+    _OT_RESET = 0
+    _OT_MOVE_S = 1
+    _OT_MOVE_F = 2
+    _OT_ENTER_S = 3
+    _OT_ENTER_F = 4
+    _OT_EXIT_S = 5
+    _OT_EXIT_F = 6
+
     def _build_topology_cache(self, states, deadline):
-        """One-shot build of the probability-independent MDP structure
-        (state-action layout + successor-state indices + per-(s,a)
-        action metadata). Sa_imm and out_prob are filled here too, but
-        they are refreshed cheaply on each replan."""
+        """One-shot build of the probability-independent MDP structure.
+
+        Outcome data is stored as parallel numpy arrays so that the
+        per-replan refresh is fully vectorised (no Python loop over the
+        millions of outcomes for the larger m_* problems):
+
+          out_type[i]       : outcome category (int8, 0..6)
+          out_entity[i]     : eidx for MOVE_*, pidx for ENTER_* / EXIT_*
+          out_n_others[i]   : |F_e ∪ {f0} \\ {target}| for MOVE_F (else 1)
+          out_is_goal[i]    : EXIT_S at the person's goal floor
+          out_all_done[i]   : EXIT_S that empties the persons list (auto-reset)
+        """
         n_states = len(states)
         state_to_idx = {s: i for i, s in enumerate(states)}
 
@@ -397,26 +414,25 @@ class Controller:
         sa_outcome_off = [0]
         action_off = [0]
         out_next = []
-        # We also need, per outcome, the *structural identity* of the
-        # outcome so we can recompute its probability + immediate reward
-        # cheaply when posteriors change. Encoding:
-        #   outcome_descr[i] = ('RESET',) | ('MOVE_S', eidx) | ('MOVE_F', eidx, k, n_others)
-        #                    | ('ENTER_S', pidx) | ('ENTER_F', pidx)
-        #                    | ('EXIT_S', pidx, is_goal, all_done)
-        #                    | ('EXIT_F', pidx)
-        # where k indexes the kth element of others_set (sorted).
-        outcome_descr = []
+        out_type = []
+        out_entity = []
+        out_n_others = []
+        out_is_goal = []
+        out_all_done = []
         sa_total = 0
         out_total = 0
 
         for s in states:
             for a in self._mdp_legal_actions(s):
                 outs = self._mdp_outcomes(s, a)
-                descrs = self._mdp_outcome_descriptors(s, a)
-                # outs and descrs must be the same length / aligned
-                for (prob, ns, r), d in zip(outs, descrs):
+                fields = self._mdp_outcome_fields(s, a)
+                for (prob, ns, r), f in zip(outs, fields):
                     out_next.append(state_to_idx[ns])
-                    outcome_descr.append(d)
+                    out_type.append(f[0])
+                    out_entity.append(f[1])
+                    out_n_others.append(f[2])
+                    out_is_goal.append(f[3])
+                    out_all_done.append(f[4])
                     out_total += 1
                 sa_action.append(a)
                 sa_outcome_off.append(out_total)
@@ -433,96 +449,105 @@ class Controller:
         )
         self._cached_action_off = np.asarray(action_off, dtype=np.int64)
         self._cached_out_next = np.asarray(out_next, dtype=np.int32)
-        self._cached_outcome_descr = outcome_descr
+        self._cached_out_type = np.asarray(out_type, dtype=np.int8)
+        self._cached_out_entity = np.asarray(out_entity, dtype=np.int32)
+        self._cached_out_n_others = np.asarray(
+            out_n_others, dtype=np.float64
+        )
+        self._cached_out_is_goal = np.asarray(out_is_goal, dtype=bool)
+        self._cached_out_all_done = np.asarray(out_all_done, dtype=bool)
+        # Pre-compute masks once.
+        self._cached_mask_reset = self._cached_out_type == self._OT_RESET
+        self._cached_mask_move_s = self._cached_out_type == self._OT_MOVE_S
+        self._cached_mask_move_f = self._cached_out_type == self._OT_MOVE_F
+        self._cached_mask_enter_s = self._cached_out_type == self._OT_ENTER_S
+        self._cached_mask_enter_f = self._cached_out_type == self._OT_ENTER_F
+        self._cached_mask_exit_s = self._cached_out_type == self._OT_EXIT_S
+        self._cached_mask_exit_f = self._cached_out_type == self._OT_EXIT_F
         self._cached_V = self._heuristic_v0(states)
 
-    def _mdp_outcome_descriptors(self, state, action):
-        """Return outcome descriptors aligned with _mdp_outcomes(state, action).
-        Each descriptor is enough to reconstruct (prob, reward) given the
-        current probability/reward estimates — without re-traversing the
-        state structure."""
+    def _mdp_outcome_fields(self, state, action):
+        """Return per-outcome (type, entity, n_others, is_goal, all_done)
+        tuples aligned with _mdp_outcomes(state, action)."""
         ef, pl = state
         DELIV = self._MDP_DELIVERED
         kind = action[0]
         if kind == 'RESET':
-            return [('RESET',)]
+            return [(self._OT_RESET, 0, 1, False, False)]
         if kind == 'MOVE':
             _, eidx, target = action
-            descrs = [('MOVE_S', eidx)]
             others_set = set(self.elev_reachable[eidx]) - {target}
             others_set.add(ef[eidx])
-            n_others = len(others_set)
-            if n_others:
-                for k in range(n_others):
-                    descrs.append(('MOVE_F', eidx, n_others))
-            return descrs
+            n_others = max(1, len(others_set))
+            out = [(self._OT_MOVE_S, eidx, 1, False, False)]
+            for _ in range(len(others_set)):
+                out.append((self._OT_MOVE_F, eidx, n_others, False, False))
+            return out
         if kind == 'ENTER':
             _, pidx, eidx = action
-            return [('ENTER_S', pidx), ('ENTER_F', pidx)]
+            return [
+                (self._OT_ENTER_S, pidx, 1, False, False),
+                (self._OT_ENTER_F, pidx, 1, False, False),
+            ]
         # EXIT
         _, pidx, eidx = action
         floor = ef[eidx]
         if floor == self.person_goal[pidx]:
             pl_s = list(pl); pl_s[pidx] = DELIV
             all_done = all(x == DELIV for x in pl_s)
-            return [('EXIT_S', pidx, True, all_done), ('EXIT_F', pidx)]
-        return [('EXIT_S', pidx, False, False), ('EXIT_F', pidx)]
+            return [
+                (self._OT_EXIT_S, pidx, 1, True, all_done),
+                (self._OT_EXIT_F, pidx, 1, False, False),
+            ]
+        return [
+            (self._OT_EXIT_S, pidx, 1, False, False),
+            (self._OT_EXIT_F, pidx, 1, False, False),
+        ]
 
     def _refresh_transitions_and_solve(self, deadline):
-        """Fill sa_imm + out_prob from current estimates (using the cached
-        outcome descriptors), then run discounted VI (warm-started from
-        the cached V) to a fixed point or until deadline."""
-        descr = self._cached_outcome_descr
-        n_out = len(descr)
-        out_prob = np.empty(n_out, dtype=np.float64)
+        """Vectorised refresh of out_prob + sa_imm from current estimates,
+        then warm-started discounted VI."""
+        n_out = self._cached_out_type.shape[0]
+        elev_p = np.asarray(self._elev_p, dtype=np.float64)
+        person_p = np.asarray(self._person_p, dtype=np.float64)
+        person_r = np.asarray(self._person_mean_r, dtype=np.float64)
+        entity = self._cached_out_entity
 
-        sa_imm_list = [0.0] * len(self._cached_sa_action)
+        out_prob = np.empty(n_out, dtype=np.float64)
+        # RESET → deterministic
+        out_prob[self._cached_mask_reset] = 1.0
+        # MOVE success / failure
+        m = self._cached_mask_move_s
+        out_prob[m] = elev_p[entity[m]]
+        m = self._cached_mask_move_f
+        out_prob[m] = (1.0 - elev_p[entity[m]]) / self._cached_out_n_others[m]
+        # ENTER success / failure
+        m = self._cached_mask_enter_s
+        out_prob[m] = person_p[entity[m]]
+        m = self._cached_mask_enter_f
+        out_prob[m] = 1.0 - person_p[entity[m]]
+        # EXIT success / failure
+        m = self._cached_mask_exit_s
+        out_prob[m] = person_p[entity[m]]
+        m = self._cached_mask_exit_f
+        out_prob[m] = 1.0 - person_p[entity[m]]
+
+        # Per-outcome reward: only EXIT_S at goal contributes.
+        out_reward = np.zeros(n_out, dtype=np.float64)
+        m_goal = self._cached_mask_exit_s & self._cached_out_is_goal
+        out_reward[m_goal] = person_r[entity[m_goal]]
+        m_full = m_goal & self._cached_out_all_done
+        out_reward[m_full] += self.goal_reward
+
         sa_outcome_off = self._cached_sa_outcome_off
-        idx = 0
-        for sa_idx in range(len(self._cached_sa_action)):
-            start = int(sa_outcome_off[sa_idx])
-            end = int(sa_outcome_off[sa_idx + 1])
-            imm = 0.0
-            for k in range(start, end):
-                d = descr[k]
-                kind = d[0]
-                if kind == 'RESET':
-                    p, r = 1.0, 0.0
-                elif kind == 'MOVE_S':
-                    p = self._elev_p[d[1]]
-                    r = 0.0
-                elif kind == 'MOVE_F':
-                    p = (1.0 - self._elev_p[d[1]]) / d[2]
-                    r = 0.0
-                elif kind == 'ENTER_S':
-                    p = self._person_p[d[1]]
-                    r = 0.0
-                elif kind == 'ENTER_F':
-                    p = 1.0 - self._person_p[d[1]]
-                    r = 0.0
-                elif kind == 'EXIT_S':
-                    _, pidx, is_goal, all_done = d
-                    p = self._person_p[pidx]
-                    if is_goal:
-                        r = self._person_mean_r[pidx]
-                        if all_done:
-                            r += self.goal_reward
-                    else:
-                        r = 0.0
-                else:  # EXIT_F
-                    p = 1.0 - self._person_p[d[1]]
-                    r = 0.0
-                out_prob[k] = p
-                imm += p * r
-            sa_imm_list[sa_idx] = imm
+        sa_starts = sa_outcome_off[:-1]
+        sa_imm = np.add.reduceat(out_prob * out_reward, sa_starts)
 
         if time.perf_counter() > deadline:
             return
 
-        sa_imm = np.asarray(sa_imm_list, dtype=np.float64)
         out_next = self._cached_out_next
         action_off = self._cached_action_off
-        sa_starts = sa_outcome_off[:-1]
         action_starts = action_off[:-1]
 
         V = self._cached_V.copy()
