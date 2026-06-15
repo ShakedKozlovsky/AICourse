@@ -75,9 +75,9 @@ class Controller:
     _TIME_BUDGET_GATE = 0.55       # stop replanning once we burned this much
     _HARD_STOP_FRAC = 0.92         # past this, return a safe action immediately
     _SHIFT_TRIGGER = 0.10          # |Delta p| trigger for surprise replan
-    _PRIOR_ALPHA = 3.0             # Beta(3, 1) -> mean 0.75, optimism close
-    _PRIOR_BETA = 1.0              # to easy-tier truth (0.95) without hiding
-                                   # broken elevators (0.30) for long
+    _PRIOR_ALPHA = 4.0             # Beta(4, 1) -> mean 0.80, closer to easy
+    _PRIOR_BETA = 1.0              # truth (0.95); hard-tier broken elevators
+                                   # take ~7 failures to drop below trigger
 
     _REWARD_PRIOR = 5.0            # placeholder mean until first delivery
     _REWARD_SAMPLES_CAP = 50
