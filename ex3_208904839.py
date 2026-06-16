@@ -79,7 +79,7 @@ class Controller:
     _PRIOR_BETA = 1.0              # truth (0.95); hard-tier broken elevators
                                    # take ~7 failures to drop below trigger
 
-    _REWARD_PRIOR = 5.0            # placeholder mean until first delivery
+    _REWARD_PRIOR = 8.0            # placeholder mean until first delivery
     _REWARD_SAMPLES_CAP = 50
     _MIN_REPLAN_INTERVAL = 10      # min steps between consecutive replans
 
