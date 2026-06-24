@@ -1,9 +1,16 @@
 """
 AI disclosure:
-  Used: Claude Code for brainstorming the controller's design and writing
-  the implementation. I (Shaked) directed the design through discussion,
-  verified correctness against the specification, ran the local checker,
-  and validated the implementation.
+  This file was developed with the assistance of Claude (Anthropic's
+  Claude Code CLI). Claude was used for:
+    - Discussing and brainstorming the controller architecture
+      (Bayesian posteriors over the hidden model, MDP+VI planning,
+      cost-shaped A* fallback, replan-trigger design).
+    - Writing the implementation code.
+    - Iterating on parameter choices via local-checker measurements.
+  I (Shaked Kozlovsky) directed every design decision, reviewed and
+  understood all code before submission, verified compliance with the
+  engine-access policy, and ran the local checker (ex3_check.py) to
+  validate behavior on the provided test problems.
 """
 
 import ext_elev
