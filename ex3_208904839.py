@@ -47,28 +47,45 @@ class _PlanState:
 class Controller:
     """Reinforcement-learning multi-elevator controller.
 
-    Two-tier strategy:
+    Three-tier action selection:
 
       Tier 1 -- Stationary discounted value iteration (gamma=0.98) on the
-      reachable MDP under the posterior-mean estimate of the hidden model.
-      Optimal for the estimated model; per-step cost is an O(1) policy
-      lookup. Used whenever the BFS-reachable state set fits the cap.
+      full reachable MDP under the posterior-mean estimate of the hidden
+      model. Optimal for the estimated model; per-step cost is an O(1)
+      policy-table lookup. Used whenever the BFS-reachable state set
+      fits the cap (_BFS_STATE_CAP = 120K states).
 
       Tier 2 -- Cost-shaped A* fallback (ported from Assignment 2) with
-      subset-strategy selection for huge problems. The A* heuristic stays
-      admissible-consistent under cost-shaping; the action costs are
-      derived from the same posterior-mean probabilities.
+      subset-strategy selection for huge problems (m3_hard / m4_hard /
+      m5_hard, where BFS hits the cap). Picks the best target subset by
+      reward/cost ratio, plans with cost-shaped A*, executes one action
+      at a time, replans when stochastic outcomes diverge from the plan.
+
+      Tier 3 -- One-step Q-lookahead under the heuristic value, used only
+      when Tier 1's policy table happens to miss the current state.
 
     Bayesian model:
-      * Beta(2, 1) prior on each elevator MOVE / person ENTER+EXIT
-        success probability, updated from observed outcomes.
-      * Per-person reward samples accumulated from observed deliveries
-        (with goal_reward subtracted when the global goal triggers).
+      * Beta(_PRIOR_ALPHA=4, _PRIOR_BETA=1) prior on each elevator MOVE /
+        person ENTER+EXIT success probability (mean 0.80). Posterior
+        updates from observed outcomes on every step.
+      * Per-person reward samples collected from observed EXIT deliveries
+        (with goal_reward subtracted when the global goal triggers an
+        auto-reset). Prior mean = _REWARD_PRIOR = 8.0 until first sample.
 
-    Replanning is gated by both a step-count schedule (gates at 25, 100)
-    and by surprise detection (any active entity probability shift >=0.10);
-    a hard time-budget gate (55% of the seed budget) stops replanning so
-    we never risk a per-seed timeout (TIMEOUT -> 0 reward).
+    Replan triggers:
+      * Scheduled gates at steps 10, 30, 80 (refinement passes).
+      * **Force-replan after each of the first 3 reward samples per
+        person**: a single sample has too much variance to commit to a
+        RESET-loop-vs-deliver-all policy; by the third sample the
+        empirical mean has settled.
+
+    Time discipline:
+      * Per-seed budget = 20 + 0.5 * horizon seconds.
+      * Replans throttled by _MIN_REPLAN_INTERVAL = 10 steps (force-
+        replan bypasses this).
+      * _TIME_BUDGET_GATE = 0.55: no more replans after 55% of budget.
+      * _HARD_STOP_FRAC = 0.92: past this, return a cheap safe action
+        immediately (TIMEOUT -> 0 reward in A3 — must never trigger).
     """
 
     _MDP_DELIVERED = 1_000_000
@@ -81,10 +98,10 @@ class Controller:
     _REPLAN_TIME_FRAC = 0.10
     _TIME_BUDGET_GATE = 0.55       # stop replanning once we burned this much
     _HARD_STOP_FRAC = 0.92         # past this, return a safe action immediately
-    _SHIFT_TRIGGER = 0.10          # |Delta p| trigger for surprise replan
     _PRIOR_ALPHA = 4.0             # Beta(4, 1) -> mean 0.80, closer to easy
-    _PRIOR_BETA = 1.0              # truth (0.95); hard-tier broken elevators
-                                   # take ~7 failures to drop below trigger
+    _PRIOR_BETA = 1.0              # truth (0.95) without hiding broken
+                                   # elevators (0.30) for long — they fall
+                                   # to mean ~0.4 after ~7 failed MOVEs
 
     _REWARD_PRIOR = 8.0            # placeholder mean until first delivery
     _REWARD_SAMPLES_CAP = 50
@@ -153,9 +170,10 @@ class Controller:
         self._cached_action_off = None
         self._cached_out_next = None
         self._cached_V = None              # warm-start across replans
-        # Force-replan flag: set whenever an observation gives us a delivery
-        # reward sample we haven't planned with yet. Bypasses the step gate
-        # — critical for reset-loop detection on rl_*.
+        # Force-replan flag: set in _observe() after each of the first 3
+        # reward samples per person, so the MDP re-evaluates with stable
+        # estimates before committing to a deliver-all vs RESET-loop
+        # policy. Bypasses _MIN_REPLAN_INTERVAL.
         self._force_replan = False
         self._last_replan_step = -1000     # step number of last replan
 
@@ -212,7 +230,7 @@ class Controller:
                 self._last_replan_step = cur_step
             self._advance_replan_gate(cur_step)
 
-        # 3. Choose action: policy lookup if available, else A* plan
+        # 3. Choose action: MDP-policy lookup, else A* plan, else lookahead.
         action = self._choose_action(state)
 
         self._last_obs_state = state
@@ -330,16 +348,15 @@ class Controller:
             return False
         if self._policy is None:
             return True
-        # Min interval throttle (bypassed by force-replan on first delivery).
+        # Min-interval throttle. Force-replan (first K=3 reward samples
+        # per person, set in _observe) bypasses it so reset-loop policies
+        # on rl_* lock in within the first few cycles.
         if not self._force_replan:
             if cur_step - self._last_replan_step < self._MIN_REPLAN_INTERVAL:
                 return False
         if self._force_replan:
             return True
-        # Otherwise, refine at the scheduled gates only. Early prob-shift
-        # bypass turned out to be noisy — refines mid-flight on a half-
-        # observed posterior, which hurt p1_hard / e2_hard. The scheduled
-        # gates (with a few extra early ones) give us better stability.
+        # Otherwise, refine only at scheduled gates.
         return cur_step >= self._next_replan_step
 
     def _advance_replan_gate(self, cur_step):
